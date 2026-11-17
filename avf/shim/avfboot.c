@@ -643,6 +643,21 @@ static uint64_t align_up(uint64_t v, uint64_t a)
 	return (v + a - 1) & ~(a - 1);
 }
 
+/*
+ * Write back and drop every cached copy of [lo, hi) (to the Point of Coherency), as xnuloader's
+ * flush_dcache() before its hand-over. This program writes with the MMU off, so its stores go to RAM
+ * and around the data cache; a line of the same address the cache still holds (crosvm's or the host
+ * kernel's cacheable view of guest RAM can put one there at any time) keeps the old bytes. XNU turns
+ * the cache on in start.s and would then run and walk page tables from those stale lines.
+ */
+static void dcache_flush_poc(uint64_t lo, uint64_t hi)
+{
+	uint64_t line = 4ULL << ((rsr("ctr_el0") >> 16) & 0xf);	/* CTR_EL0.DminLine: log2 of words */
+	for (uint64_t p = lo & ~(line - 1); p < hi; p += line)
+		__asm__ volatile("dc civac, %0" : : "r"(p) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 /* start.S: where a core started with PSCI CPU_ON enters, to jump to hop_entry(hop_arg) */
 void avfboot_hop(void);
@@ -1088,6 +1103,8 @@ void avfboot_main(uint64_t fdt_pa)
 	uart_puts("\n\n");
 
 	stage = "xnu";
+	/* everything XNU reads with the cache on: its image, the RAM disk, the device tree, boot_args */
+	dcache_flush_poc(kern_lo, top);
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
 	if (m.mpidr[0] != m.self) {
 		/* the kernel starts on the big core (see "fdt: cpus"); this one switches itself off */
