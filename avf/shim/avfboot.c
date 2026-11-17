@@ -658,6 +658,187 @@ static void dcache_flush_poc(uint64_t lo, uint64_t hi)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
+/* start.S, diagnostic avf_cachescan=1 (scan, flush, scan) or 2 (scan, no flush) */
+uint64_t avfboot_stale_scan(uint64_t lo, uint64_t hi, uint64_t *l1, uint64_t alias, uint64_t *first);
+static uint64_t scan_l1[512] __attribute__((aligned(4096)));
+#define SCAN_ALIAS	(256ULL << 30)
+
+static void stale_scan(const char *what, uint64_t lo, uint64_t hi)
+{
+	for (uint64_t gb = 0; gb < 256; gb++) {
+		int ram = gb >= (m.ram_lo >> 30) && gb < ((m.ram_hi + (1ULL << 30) - 1) >> 30);
+		/* block, AF, inner shareable; attr index 0 at PA, 1 at the alias */
+		scan_l1[gb] = ram ? (gb << 30) | (1 << 10) | (3 << 8) | 1 : 0;
+		scan_l1[256 + gb] = ram ? (gb << 30) | (1 << 10) | (3 << 8) | (1 << 2) | 1 : 0;
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	uint64_t t0 = rsr("cntvct_el0"), first = 0;
+	uint64_t n = avfboot_stale_scan(lo & ~63ULL, (hi + 63) & ~63ULL, scan_l1, SCAN_ALIAS, &first);
+	uart_puts("avfboot: cachescan ");
+	uart_puts(what);
+	uart_kv(": stale lines ", n);
+	uart_kv(" first ", first);
+	uart_kv(" of ", lo);
+	uart_kv("-", hi);
+	uart_kv(" ticks ", rsr("cntvct_el0") - t0);
+	uart_putc('\n');
+}
+
+/*
+ * Diagnostic avf_cpacr=MS: the core the kernel is handed to (avfboot_hop), MMU off, sets CPACR_EL1.FPEN
+ * as start.s does and watches it for MS milliseconds before it jumps in.
+ */
+void avfboot_hop_main(void)
+{
+	if (has_arg(m.bootargs, "avf_hopdelay=")) {
+		uint64_t frq = rsr("cntfrq_el0"), t0 = rsr("cntvct_el0");
+		while (rsr("cntvct_el0") - t0 < frq * arg_num(m.bootargs, "avf_hopdelay=") / 1000)
+			;
+		uart_kv("avfboot-hop: waited ms ", arg_num(m.bootargs, "avf_hopdelay="));
+		uart_putc('\n');
+	}
+	if (has_arg(m.bootargs, "avf_fptouch=")) {
+		uint64_t t0 = rsr("cntvct_el0");
+		__asm__ volatile("msr cpacr_el1, %0; isb; .arch_extension fp; fmov d0, xzr; fmov d1, d0" : : "r"(3ULL << 20) : "memory");
+		uart_kv("avfboot-hop: FP used fine, ticks ", rsr("cntvct_el0") - t0);
+		uart_kv(" cpacr ", rsr("cpacr_el1"));
+		uart_putc('\n');
+	}
+	if (!has_arg(m.bootargs, "avf_cpacr="))
+		return;
+	const uint64_t on = 3ULL << 20;
+	uint64_t frq = rsr("cntfrq_el0"), t0 = rsr("cntvct_el0");
+	uint64_t end = t0 + frq * arg_num(m.bootargs, "avf_cpacr=") / 1000, last = on, lost = 0;
+	__asm__ volatile("msr cpacr_el1, %0; isb" : : "r"(on));
+	for (uint64_t t; (t = rsr("cntvct_el0")) < end;) {
+		uint64_t v = rsr("cpacr_el1");
+		if (v != last) {
+			uart_kv("avfboot-hop: CPACR_EL1 ", v);
+			uart_kv(" after ", (t - t0) * 1000000 / frq);
+			uart_puts(" us\n");
+			last = v;
+			if (v != on) {
+				lost++;
+				__asm__ volatile("msr cpacr_el1, %0; isb" : : "r"(on));
+				last = on;
+			}
+		}
+	}
+	uart_kv("avfboot-hop: CPACR_EL1 lost ", lost);
+	uart_kv(" times; now ", rsr("cpacr_el1"));
+	uart_kv(" mpidr ", rsr("mpidr_el1"));
+	uart_putc('\n');
+}
+
+/*
+ * Diagnostic avf_ckpt=N: the kernel's loader_stub_slot ("XNULDRST") gets avfboot_kreturn and checkpoint N
+ * (start.s: 1 entry, 2 vectors set, 3 bootstrap tables written, 4 before the MMU, 5 MMU on); an early
+ * exception comes back the same way.
+ */
+void avfboot_kreturn(void);
+void avfboot_kernel_returned(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5,
+    uint64_t x6, uint64_t x7)
+{
+	uart_kv("\navfboot: back from the kernel: reason ", x2);
+	uart_kv(" code/esr ", x3);
+	uart_kv(" elr ", x4);
+	uart_kv(" far ", x5);
+	uart_kv(" lr ", x6);
+	uart_kv(" sp ", x7);
+	uart_kv(" log ", x0);
+	uart_kv("+", x1);
+	uart_kv(" mpidr ", rsr("mpidr_el1"));
+	uart_kv(" t ", rsr("cntvct_el0"));
+	uart_putc('\n');
+	die("checkpoint");
+}
+
+/*
+ * Diagnostic avf_watch=1: the core avfboot ran on (left out of the kernel's) stays on, turns on its own
+ * MMU and caches (coherent with the kernel's core) and prints the kernel's loader log (loader_live,
+ * "XNULIVE!") and its heartbeat to the console as it goes, for 120 s.
+ */
+void avfboot_mmu_on(uint64_t *l1);
+static void dc_civac(const volatile void *p)
+{
+	__asm__ volatile("dc civac, %0" : : "r"(p) : "memory");
+}
+static volatile uint64_t *find_live(uint64_t lo, uint64_t hi)
+{
+	for (volatile uint64_t *q = (volatile uint64_t *)lo; q < (volatile uint64_t *)hi; q++)
+		if (*q == 0x214556494c554e58ULL)
+			return q;
+	return 0;
+}
+static void __attribute__((noreturn)) watch(volatile uint64_t *live, uint64_t slide)
+{
+	uart_kv("avfboot-watch: loader_live at ", (uintptr_t)live);
+	uart_kv(" magic now ", live ? live[0] : 0);
+	uart_putc('\n');
+	if (!live) {
+		psci_call(PSCI_CPU_OFF, 0, 0, 0);
+		for (;;)
+			__asm__ volatile("wfe");
+	}
+	for (uint64_t gb = 0; gb < 512; gb++) {
+		int ram = gb >= (m.ram_lo >> 30) && gb < ((m.ram_hi + (1ULL << 30) - 1) >> 30);
+		scan_l1[gb] = gb == 0 ? (1 << 10) | (2 << 2) | (3ULL << 53) | 1 :
+		    ram ? (gb << 30) | (1 << 10) | (3 << 8) | 1 : 0;
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	avfboot_mmu_on(scan_l1);
+	const volatile char *log = (const volatile char *)(live[2] + slide);
+	const volatile uint32_t *len = (const volatile uint32_t *)(live[3] + slide);
+	uint64_t head = live[6], frq = rsr("cntfrq_el0"), t0 = rsr("cntvct_el0"), next = 0, hb = ~0ULL;
+	uint32_t done = 0, dumped = 0;
+	for (;;) {
+		uint64_t t = (rsr("cntvct_el0") - t0) / frq;
+		dc_civac(len);
+		dc_civac(&live[1]);
+		__asm__ volatile("dsb sy" ::: "memory");
+		uint32_t n = *len;
+		if (n > head)
+			n = (uint32_t)head;
+		while (done < n) {
+			if (!(((uintptr_t)(log + done)) & 63)) {
+				dc_civac(log + done);
+				__asm__ volatile("dsb sy" ::: "memory");
+			}
+			uart_putc(log[done++]);
+		}
+		if (t >= next || live[1] != hb) {
+			if (t >= next)
+				next = t + 5;
+			hb = live[1];
+			uart_kv("\navfboot-watch: t=", t);
+			uart_kv(" heartbeat ", hb);
+			uart_kv(" log ", n);
+			uart_putc('\n');
+		}
+		if (t == 3 && dumped == 0) {
+			/* avf_dumpva=VA avf_dumplen=N: N bytes of the kernel's memory at VA (static, pa = va + slide) */
+			dumped = 1;
+			uint64_t va = arg_num(m.bootargs, "avf_dumpva="), dl = arg_num(m.bootargs, "avf_dumplen=");
+			for (uint64_t o = 0; va && o < dl; o += 8) {
+				volatile uint64_t *p = (volatile uint64_t *)(va + slide + o);
+				if (!(o & 63)) {
+					dc_civac(p);
+					__asm__ volatile("dsb sy" ::: "memory");
+				}
+				if (!(o & 31))
+					uart_kv("\navfboot-dump ", va + o);
+				uart_kv(" ", *p);
+			}
+			uart_putc('\n');
+		}
+		if (t > 120)
+			break;
+	}
+	psci_call(PSCI_CPU_OFF, 0, 0, 0);
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 /* start.S: where a core started with PSCI CPU_ON enters, to jump to hop_entry(hop_arg) */
 void avfboot_hop(void);
@@ -1103,17 +1284,53 @@ void avfboot_main(uint64_t fdt_pa)
 	uart_puts("\n\n");
 
 	stage = "xnu";
+	if (has_arg(m.bootargs, "avf_ckpt=")) {
+		for (volatile uint64_t *q = (volatile uint64_t *)kern_lo; q < (volatile uint64_t *)kern_hi; q++)
+			if (*q == 0x545352444C554E58ULL /* "XNULDRST" */) {
+				q[1] = (uintptr_t)avfboot_kreturn;
+				q[2] = arg_num(m.bootargs, "avf_ckpt=");
+				q[3] = slide;
+				uart_kv("avfboot: return slot at ", (uintptr_t)q);
+				uart_kv(" checkpoint ", q[2]);
+				uart_putc('\n');
+				break;
+			}
+	}
+	uint64_t trapvec = arg_num(m.bootargs, "avf_trapvec=");
+	if (trapvec) {
+		extern const uint32_t trapvec_tmpl[], trapvec_tmpl_end[];
+		for (uint64_t slot = 0; slot <= 0x200; slot += 0x200) {
+			volatile uint32_t *d = (volatile uint32_t *)(trapvec + slide + slot);
+			for (const uint32_t *s = trapvec_tmpl; s < trapvec_tmpl_end; s++)
+				*d++ = *s;
+		}
+		uart_kv("avfboot: kernel's synchronous vectors trapped at ", trapvec);
+		uart_putc('\n');
+	}
+	uint64_t scan = arg_num(m.bootargs, "avf_cachescan=");
+	if (scan)
+		stale_scan("before flush", kern_lo, top);
 	/* everything XNU reads with the cache on: its image, the RAM disk, the device tree, boot_args */
-	dcache_flush_poc(kern_lo, top);
+	if (scan != 2)
+		dcache_flush_poc(kern_lo, top);
+	if (scan == 1)
+		stale_scan("after flush", kern_lo, top);
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
 	if (m.mpidr[0] != m.self) {
 		/* the kernel starts on the big core (see "fdt: cpus"); this one switches itself off */
 		hop_entry = entry_va + slide;
 		hop_arg = ba_pa;
+		volatile uint64_t *live = arg_num(m.bootargs, "avf_watch=") ? find_live(kern_lo, kern_hi) : 0;
+		if (live) {
+			uart_kv("avfboot-watch: loader_live before the jump at ", (uintptr_t)live);
+			uart_putc('\n');
+		}
 		__asm__ volatile("dsb sy" ::: "memory");
 		uint64_t r = psci_call(PSCI_CPU_ON_64, m.mpidr[0], (uint64_t)(uintptr_t)avfboot_hop, 0);
 		if (r != 0)
 			die("PSCI CPU_ON of the big core failed (kernel parameter avf_bigcore=0 boots on this one)");
+		if (arg_num(m.bootargs, "avf_watch="))
+			watch(live, slide);
 		psci_call(PSCI_CPU_OFF, 0, 0, 0);
 		for (;;)
 			__asm__ volatile("wfe");

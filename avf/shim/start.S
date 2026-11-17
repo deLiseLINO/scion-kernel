@@ -76,15 +76,176 @@ _start:
 	.globl avfboot_hop
 avfboot_hop:
 	msr	daifset, #0xf
-	adrp	x1, hop_entry
-	ldr	x1, [x1, :lo12:hop_entry]
-	adrp	x0, hop_arg
-	ldr	x0, [x0, :lo12:hop_arg]
+	adr	x9, vectors
+	msr	vbar_el1, x9
 	dsb	sy
 	ic	iallu
 	dsb	sy
 	isb
+	adrp	x9, kret_stack_top
+	add	x9, x9, :lo12:kret_stack_top
+	mov	sp, x9
+	bl	avfboot_hop_main
+	adrp	x1, hop_entry
+	ldr	x1, [x1, :lo12:hop_entry]
+	adrp	x0, hop_arg
+	ldr	x0, [x0, :lo12:hop_arg]
 	br	x1
+
+/*
+ * Diagnostic (avf_cachescan=): how many 64-byte lines of [lo, hi) read differently through a
+ * cacheable mapping than RAM holds, i.e. stale lines in the data cache.
+ *   uint64_t avfboot_stale_scan(uint64_t lo, uint64_t hi, uint64_t *l1, uint64_t alias, uint64_t *first)
+ * l1: a 4 KB L1 table (39-bit VA, 4 KB granule, 1 GB blocks) mapping RAM at VA = PA with MAIR
+ * index 0 (Normal write-back) and at VA = PA + alias with index 1 (Normal non-cacheable).
+ * The MMU and data cache are on only inside the loop, which touches no memory but the range.
+ */
+	.globl avfboot_stale_scan
+avfboot_stale_scan:
+	mrs	x9, sctlr_el1
+	mrs	x12, mair_el1
+	mrs	x13, tcr_el1
+	mrs	x14, ttbr0_el1
+	mov	x10, #0x44ff		/* attr0 WB, attr1 NC */
+	msr	mair_el1, x10
+	mov	x11, #0x19		/* T0SZ 25, walks non-cacheable, 4 KB granule */
+	movk	x11, #0x80, lsl #16	/* EPD1 */
+	movk	x11, #2, lsl #32	/* IPS 40 bits */
+	msr	tcr_el1, x11
+	msr	ttbr0_el1, x2
+	isb
+	tlbi	vmalle1
+	dsb	nsh
+	isb
+	mov	x15, #5			/* M, C */
+	orr	x15, x9, x15
+	mov	x5, #0
+	mov	x6, #0
+	msr	sctlr_el1, x15
+	isb
+1:	cmp	x0, x1
+	b.hs	3f
+	add	x7, x0, x3
+	ldp	x8, x10, [x0]
+	ldp	x11, x16, [x7]
+	cmp	x8, x11
+	ccmp	x10, x16, #0, eq
+	b.ne	2f
+	ldp	x8, x10, [x0, #16]
+	ldp	x11, x16, [x7, #16]
+	cmp	x8, x11
+	ccmp	x10, x16, #0, eq
+	b.ne	2f
+	ldp	x8, x10, [x0, #32]
+	ldp	x11, x16, [x7, #32]
+	cmp	x8, x11
+	ccmp	x10, x16, #0, eq
+	b.ne	2f
+	ldp	x8, x10, [x0, #48]
+	ldp	x11, x16, [x7, #48]
+	cmp	x8, x11
+	ccmp	x10, x16, #0, eq
+	b.ne	2f
+	add	x0, x0, #64
+	b	1b
+2:	cbnz	x5, 4f
+	mov	x6, x0
+4:	add	x5, x5, #1
+	add	x0, x0, #64
+	b	1b
+3:	msr	sctlr_el1, x9
+	isb
+	msr	mair_el1, x12
+	msr	tcr_el1, x13
+	msr	ttbr0_el1, x14
+	isb
+	tlbi	vmalle1
+	dsb	nsh
+	ic	iallu
+	dsb	nsh
+	isb
+	str	x6, [x4]
+	mov	x0, x5
+	ret
+
+/*
+ * Diagnostic (avf_watch=): avfboot_mmu_on(l1) turns the MMU and caches on for good with that L1
+ * table (MAIR attr0 write-back, attr1 non-cacheable, attr2 Device-nGnRnE; TCR as the scan's).
+ */
+	.globl avfboot_mmu_on
+avfboot_mmu_on:
+	mov	x10, #0x44ff
+	msr	mair_el1, x10
+	mov	x11, #0x19
+	movk	x11, #0x80, lsl #16
+	movk	x11, #2, lsl #32
+	msr	tcr_el1, x11
+	msr	ttbr0_el1, x0
+	isb
+	tlbi	vmalle1
+	dsb	nsh
+	isb
+	mrs	x9, sctlr_el1
+	orr	x9, x9, #1
+	orr	x9, x9, #4
+	orr	x9, x9, #0x1000
+	msr	sctlr_el1, x9
+	isb
+	ret
+
+/*
+ * Diagnostic (avf_ckpt=): the kernel's loader return stub (its loader_stub_slot): entered with the
+ * MMU off from start.s's LOADER_CHECKPOINT (x2 = 2, x3 = checkpoint) or its early exception
+ * vector (x2 = 1, x3-x7 = ESR, ELR, FAR, LR, SP), or loader_return.c. Reports and powers off.
+ */
+	.globl avfboot_kreturn
+avfboot_kreturn:
+	msr	daifset, #0xf
+	adrp	x9, kret_stack_top
+	add	x9, x9, :lo12:kret_stack_top
+	mov	sp, x9
+	bl	avfboot_kernel_returned
+7:	wfe
+	b	7b
+
+	.bss
+	.balign	16
+kret_stack:
+	.space	0x2000
+kret_stack_top:
+	.text
+
+/*
+ * Diagnostic (avf_trapvec=VA of the kernel's ExceptionVectorsBase): copied over its synchronous
+ * vectors (current EL, SP0 and SP1). Records ESR, ELR, FAR, LR, SP, FP, SPSR and a marker in the
+ * vector slot 0x180 above (SError, never taken this early) and spins there.
+ */
+	.globl trapvec_tmpl, trapvec_tmpl_end
+	.balign	4
+trapvec_tmpl:
+	adr	x9, trapvec_tmpl + 0x180
+	mrs	x16, esr_el1
+	str	x16, [x9]
+	mrs	x16, elr_el1
+	str	x16, [x9, #8]
+	mrs	x16, far_el1
+	str	x16, [x9, #16]
+	str	x30, [x9, #24]
+	mov	x16, sp
+	str	x16, [x9, #32]
+	str	x29, [x9, #40]
+	mrs	x16, spsr_el1
+	str	x16, [x9, #48]
+	mrs	x16, cpacr_el1
+	str	x16, [x9, #64]
+	mrs	x16, cntvct_el0
+	str	x16, [x9, #72]
+	mov	x16, #0x5452
+	str	x16, [x9, #56]
+	dsb	sy
+8:	wfe
+	b	8b
+trapvec_tmpl_end:
 
 /*
  * Exceptions: every slot saves x0-x30 and calls avfboot_exception(slot, regs),
